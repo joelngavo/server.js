@@ -14,7 +14,7 @@ app.use(cors());
 
 // --- 1. CONNEXION À VOTRE BASE DE DONNÉES (Hostinger) ---
 const dbConfig = {
-    host: 'localhost', // Sur Hostinger, Node.js et MySQL cohabitent sur la même machine (localhost)
+    host: 'https://api.accofadeservices.com', // Sur Hostinger, Node.js et MySQL cohabitent sur la même machine (localhost)
     user: 'u418079139_tundajoel', 
     password: '301987joelNGAVO@', 
     database: 'u418079139_accofadebd'
