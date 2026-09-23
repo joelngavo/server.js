@@ -5,17 +5,18 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const qrcode = require('qrcode-terminal');
+const qrcodeLib = require('qrcode');
 const cors = require('cors');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// --- 1. CONNEXION À VOTRE BASE DE DONNÉES ---
+// --- 1. CONNEXION À VOTRE BASE DE DONNÉES (Hostinger) ---
 const dbConfig = {
-    host: 'localhost',
-    user: 'u418079139_accofadebd', // Remplacez par votre utilisateur MySQL si différent
-    password: 'VOTRE_MOT_DE_PASSE_DB', // Mettez votre mot de passe MySQL
+    host: 'localhost', // Sur Hostinger, Node.js et MySQL cohabitent sur la même machine (localhost)
+    user: 'u418079139_tundajoel', 
+    password: '301987joelNGAVO@', 
     database: 'u418079139_accofadebd'
 };
 
@@ -30,7 +31,7 @@ async function initDB() {
 }
 initDB();
 
-// --- 2. DOSSIERS DE STOCKAGE DANS "messagerie_whatsapp" ---
+// --- 2. DOSSIERS DE STOCKAGE ---
 const baseUploadDir = path.join(__dirname, '../messagerie_whatsapp/uploads');
 
 const storageDirs = {
@@ -41,12 +42,10 @@ const storageDirs = {
     document: path.join(baseUploadDir, 'documents')
 };
 
-// Création automatique des dossiers s'ils n'existent pas
 Object.values(storageDirs).forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// Config Multer pour l'envoi de fichiers médias
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         const ext = path.extname(file.originalname).toLowerCase();
@@ -69,8 +68,9 @@ const sessions = {};
 
 async function updateSessionStatus(sessionName, isConnected, phoneNumber = null) {
     try {
+        if (!db) return;
         await db.query(
-            `UPDATE whatsapp_sessions SET is_connected = ?, phone_number = COALESCE(?, phone_number) WHERE session_name = ?`,
+            `UPDATE whatsapp_sessions SET is_connected = ?, phone_number = COALESCE(?, phone_number), last_seen = CURRENT_TIMESTAMP WHERE session_name = ?`,
             [isConnected ? 1 : 0, phoneNumber, sessionName]
         );
     } catch (err) {
@@ -87,12 +87,15 @@ async function startSession(sessionName) {
         printQRInTerminal: true
     });
 
+    sessions[sessionName] = { sock, isConnected: false, phone: null, qr: null };
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            sessions[sessionName].qr = qr;
             console.log(`\n========================================`);
             console.log(`  QR Code pour : ${sessionName.toUpperCase()}`);
             console.log(`========================================`);
@@ -101,6 +104,7 @@ async function startSession(sessionName) {
 
         if (connection === 'close') {
             sessions[sessionName].isConnected = false;
+            sessions[sessionName].phone = null;
             await updateSessionStatus(sessionName, false);
             const shouldReconnect = (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut);
             console.log(`[${sessionName}] Connexion fermée. Reconnexion...`, shouldReconnect);
@@ -109,17 +113,19 @@ async function startSession(sessionName) {
             const userPhone = sock.user.id.split(':')[0];
             sessions[sessionName].isConnected = true;
             sessions[sessionName].phone = userPhone;
+            sessions[sessionName].qr = null; 
             await updateSessionStatus(sessionName, true, userPhone);
             console.log(`✅ [${sessionName}] Connecté avec le numéro: ${userPhone}`);
         }
     });
 
-    // ÉCOUTE DES MESSAGES ENTRANTS DE VOS CLIENTS
+    // ÉCOUTE DES MESSAGES ENTRANTS (Enregistrement structuré selon votre table messages_whatsapp)
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
             if (msg.key.fromMe) continue;
+            if (!db) continue;
 
             const senderPhone = msg.key.remoteJid.split('@')[0];
             let messageText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
@@ -133,7 +139,7 @@ async function startSession(sessionName) {
                 const fileName = msg.message.documentMessage.fileName || '';
                 messageType = fileName.endsWith('.pdf') ? 'pdf' : 'document';
                 const ext = path.extname(fileName) || '.bin';
-                mediaPath = await saveIncomingMedia(msg, storageDirs[messageType], ext);
+                mediaPath = await saveIncomingMedia(msg, storageDirs[messageType] || storageDirs.document, ext);
             } else if (msg.message?.audioMessage) {
                 messageType = 'audio';
                 mediaPath = await saveIncomingMedia(msg, storageDirs.audio, '.ogg');
@@ -142,18 +148,16 @@ async function startSession(sessionName) {
                 mediaPath = await saveIncomingMedia(msg, storageDirs.video, '.mp4');
             }
 
-            // Sauvegarde dans u418079139_accofadebd
+            // Insertion conforme à votre structure de table messages_whatsapp
             await db.query(
                 `INSERT INTO messages_whatsapp (direction, sender_phone, receiver_phone, message_type, message_text, media_path, session_used, status)
                  VALUES ('RECEIVED', ?, ?, ?, ?, ?, ?, 'RECEIVED')`,
                 [senderPhone, sessions[sessionName].phone || 'LOCAL', messageType, messageText, mediaPath, sessionName]
             );
 
-            console.log(`📩 Message reçu de ${senderPhone} enregistrer dans u418079139_accofadebd`);
+            console.log(`📩 Message entrant de ${senderPhone} enregistré dans la BDD`);
         }
     });
-
-    sessions[sessionName] = { sock, isConnected: false, phone: null };
 }
 
 async function saveIncomingMedia(msg, dir, ext) {
@@ -169,12 +173,11 @@ async function saveIncomingMedia(msg, dir, ext) {
     }
 }
 
-// Initialiser les 5 numéros au démarrage
+// Initialisation des 5 sessions au démarrage
 for (let i = 1; i <= NUM_SESSIONS; i++) {
     startSession(`numero_${i}`);
 }
 
-// Trouver le premier numéro connecté
 function getAvailableSession() {
     for (const [key, session] of Object.entries(sessions)) {
         if (session.isConnected && session.sock) {
@@ -184,7 +187,7 @@ function getAvailableSession() {
     return null;
 }
 
-// --- 4. ROUTES API_ngavo_markting ---
+// --- 4. ROUTES API ---
 
 // Route 1: Envoyer un message texte
 app.post('/api/send-message', async (req, res) => {
@@ -199,6 +202,7 @@ app.post('/api/send-message', async (req, res) => {
     try {
         await activeSession.sock.sendMessage(formattedPhone, { text: message });
 
+        // Enregistrement d'un message sortant (SENT)
         await db.query(
             `INSERT INTO messages_whatsapp (direction, sender_phone, receiver_phone, message_type, message_text, session_used, status)
              VALUES ('SENT', ?, ?, 'text', ?, ?, 'SENT')`,
@@ -212,7 +216,7 @@ app.post('/api/send-message', async (req, res) => {
     }
 });
 
-// Route 2: Envoyer un média (PDF, Image, Video, Audio)
+// Route 2: Envoyer un média (PDF, Image, Video, Audio, Document)
 app.post('/api/send-media', upload.single('file'), async (req, res) => {
     const { phone, caption } = req.body;
     const file = req.file;
@@ -241,12 +245,14 @@ app.post('/api/send-media', upload.single('file'), async (req, res) => {
         messageType = 'video';
         messageOptions = { video: fs.readFileSync(file.path), caption: caption || '' };
     } else {
-        messageOptions = { document: fs.readFileSync(file.path), mimetype: 'application/octet-stream', fileName: file.originalname };
+        messageType = 'document';
+        messageOptions = { document: fs.readFileSync(file.path), mimetype: 'application/octet-stream', fileName: file.originalname, caption: caption || '' };
     }
 
     try {
         await activeSession.sock.sendMessage(formattedPhone, messageOptions);
 
+        // Insertion correcte correspondant aux 8 colonnes insérées
         await db.query(
             `INSERT INTO messages_whatsapp (direction, sender_phone, receiver_phone, message_type, message_text, media_path, session_used, status)
              VALUES ('SENT', ?, ?, ?, ?, ?, ?, 'SENT')`,
@@ -260,14 +266,35 @@ app.post('/api/send-media', upload.single('file'), async (req, res) => {
     }
 });
 
-// Route 3: Statut des 5 sessions
+// Route 3: Statut de toutes les sessions (lit directement la table whatsapp_sessions)
 app.get('/api/sessions-status', async (req, res) => {
-    const [rows] = await db.query('SELECT * FROM whatsapp_sessions');
-    return res.json(rows);
+    try {
+        const [rows] = await db.query('SELECT * FROM whatsapp_sessions');
+        return res.json(rows);
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
 });
 
-// Démarrage du serveur API_ngavo_markting
-const PORT = 3000;
+// Route 4: Route d'affichage dynamique du QR code en image PNG sur le Dashboard PHP
+app.get('/api/qr/:sessionName', async (req, res) => {
+    const sessionName = req.params.sessionName;
+    const session = sessions[sessionName];
+
+    if (!session || !session.qr) {
+        return res.status(404).send('QR Code non disponible ou session déjà connectée.');
+    }
+
+    try {
+        res.setHeader('Content-Type', 'image/png');
+        await qrcodeLib.toStream(res, session.qr, { width: 300 });
+    } catch (err) {
+        res.status(500).send('Erreur génération QR Code');
+    }
+});
+
+// Démarrage du serveur
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 API_ngavo_markting opérationnel sur http://localhost:${PORT}`);
+    console.log(`🚀 API opérationnelle sur le port ${PORT}`);
 });
